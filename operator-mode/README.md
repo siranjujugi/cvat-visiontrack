@@ -4,14 +4,15 @@ Local Operator Mode turns the CVAT Community annotation engine into a workstatio
 VisionTrack review tool. It is isolated from VisionTrack Runtime and Studio and is intended for
 operators, investigators, ML engineers, and data analysts creating certified ground truth.
 
-This first implementation is Mac-first. It uses pinned CVAT `v2.76.0` images and runs them inside
-a dedicated Colima VM with Rosetta on Apple Silicon because official CVAT server images are
-currently AMD64-only. The operator launches one macOS application; Docker and Compose remain
-implementation details.
+The macOS implementation uses pinned CVAT `v2.76.0` images inside a dedicated Colima VM with
+Rosetta on Apple Silicon. A Windows x64 setup is also provided using Docker Desktop's WSL2 Linux
+engine. CVAT services use pinned `linux/amd64` images; native Windows ARM is not in the supported
+matrix. Docker and Compose remain implementation details for operators.
 
 ## Included
 
 - One-command macOS dependency setup and application installation.
+- Windows PowerShell setup, dependency checks, local lifecycle commands, and click-to-start wrapper.
 - Dedicated local CVAT runtime bound only to `127.0.0.1`.
 - Visible workspace under `~/VisionTrackWorkbench`.
 - Read-only source-video mounting with `copy_data=false` and `use_cache=true`.
@@ -68,6 +69,46 @@ work, maintain at least 30 GB free.
 You can subsequently open **VisionTrack Workbench** from `~/Applications`. Startup is idempotent.
 The importer is also idempotent: completed tasks are retained and incomplete failed tasks are safely
 recreated.
+
+## Install On Windows
+
+Supported initial target: Windows 10/11 x64 with WSL2 and Docker Desktop configured to use Linux
+containers. PowerShell 7, Python 3.12, FFmpeg (`ffprobe`), Docker Desktop, and Docker Compose v2 are
+required. Docker Desktop may require administrator approval and a restart. Docker Desktop licensing
+terms apply to the customer's organization.
+
+Open PowerShell 7 in the repository root. The guided installer checks prerequisites and creates a
+private workspace under `%LOCALAPPDATA%\VisionTrackWorkbench`:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+./operator-mode/scripts/install_windows.ps1 `
+  -InputDir 'D:\VisionTrack\Videos' `
+  -InstallPrerequisites
+```
+
+`-InstallPrerequisites` opts in to installing Docker Desktop, Python 3.12, and FFmpeg through
+`winget`. Docker Desktop may prompt for administrator approval. Restart Windows if Docker Desktop
+or WSL2 requests it, then rerun the installer. To install dependencies yourself, omit the switch,
+follow the reported commands, and rerun after Docker Desktop/WSL2 are ready. Keep source videos on a
+local NTFS drive for reliable bind mounts; network shares and removable drives are not supported in
+this initial Windows setup.
+
+Pull the pinned images once, then start the Workbench:
+
+```powershell
+./operator-mode/scripts/workbench.ps1 pull
+./operator-mode/scripts/workbench.ps1 start
+./operator-mode/scripts/workbench.ps1 credentials
+./operator-mode/scripts/workbench.ps1 import-comparison
+./operator-mode/scripts/workbench.ps1 open
+```
+
+For subsequent starts, use `operator-mode/scripts/start_workbench.cmd` or run
+`workbench.ps1 start` and `workbench.ps1 open`. Windows workspace data, exports, backups, and logs
+are stored under `%LOCALAPPDATA%\VisionTrackWorkbench`; the source folder is mounted read-only.
+`stop` and `shutdown` retain PostgreSQL data and annotations. Do not delete the `workspace` directory
+unless you intend to remove the local annotation database and state.
 
 ## Annotation Contract
 
@@ -126,3 +167,13 @@ VTW_INPUT_DIR=/Users/siranjeevi/Fork/visiontrack/data/eval/offline-080126 \
 VTW_POSTGRES_PASSWORD=test-only \
 docker-compose -f operator-mode/compose.yml config --quiet
 ```
+
+On Windows, validate the host-side setup with:
+
+```powershell
+./operator-mode/scripts/workbench.ps1 install-deps
+./operator-mode/scripts/workbench.ps1 status
+```
+
+The Windows launcher needs a Windows host to validate Docker Desktop, NTFS bind mounts, and
+container health end-to-end; macOS unit tests do not certify Windows runtime compatibility.
