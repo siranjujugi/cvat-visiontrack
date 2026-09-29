@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OPERATOR_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd)
+REPO_ROOT=$(cd -- "$OPERATOR_DIR/.." && pwd)
+COMPOSE_FILE="$OPERATOR_DIR/compose.yml"
+LABELS_FILE="$OPERATOR_DIR/config/visiontrack-labels.json"
+COMPARISON_MANIFEST="$OPERATOR_DIR/config/comparison-five-segments.json"
+DEFAULT_INPUT_DIR="/Users/siranjeevi/Fork/visiontrack/data/eval/offline-080126"
+
+WORKBENCH_HOME=${VISIONTRACK_WORKBENCH_HOME:-"$HOME/VisionTrackWorkbench"}
+CONFIG_DIR="$WORKBENCH_HOME/config"
+ENV_FILE="$CONFIG_DIR/workbench.env"
+PYTHON_ENV="$WORKBENCH_HOME/runtime/python"
+
+log() {
+    printf '[VisionTrack Workbench] %s\n' "$*"
+}
+
+fail() {
+    printf '[VisionTrack Workbench] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+quote_env() {
+    local value=${1//\\/\\\\}
+    value=${value//\"/\\\"}
+    printf '"%s"' "$value"
+}
+
+random_secret() {
+    openssl rand -hex 24
+}
+
+initialize_config() {
+    local input_dir=${1:-${VTW_INPUT_DIR_OVERRIDE:-$DEFAULT_INPUT_DIR}}
+    mkdir -p \
+        "$CONFIG_DIR" \
+        "$WORKBENCH_HOME/workspace/cvat-data" \
+        "$WORKBENCH_HOME/workspace/keys" \
+        "$WORKBENCH_HOME/workspace/postgres" \
+        "$WORKBENCH_HOME/workspace/redis" \
+        "$WORKBENCH_HOME/logs/cvat" \
+        "$WORKBENCH_HOME/exports" \
+        "$WORKBENCH_HOME/backups"
+
+    if [[ ! -f "$ENV_FILE" ]]; then
+        [[ -d "$input_dir" ]] || fail "Input directory does not exist: $input_dir"
+        {
+            printf 'CVAT_VERSION=v2.76.0\n'
+            printf 'VTW_HOME=%s\n' "$(quote_env "$WORKBENCH_HOME")"
+            printf 'VTW_INPUT_DIR=%s\n' "$(quote_env "$(cd -- "$input_dir" && pwd)")"
+            printf 'VTW_PORT=8787\n'
+            printf 'VTW_POSTGRES_PASSWORD=%s\n' "$(random_secret)"
+            printf 'VTW_ADMIN_USERNAME=operator\n'
+            printf 'VTW_ADMIN_PASSWORD=%s\n' "$(random_secret)"
+            printf 'VTW_MIN_FREE_GB=15\n'
+            printf 'VTW_COLIMA_PROFILE=visiontrack-workbench\n'
+            printf 'VTW_COLIMA_CPUS=4\n'
+            printf 'VTW_COLIMA_MEMORY_GB=8\n'
+            printf 'VTW_COLIMA_DISK_GB=60\n'
+        } > "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        log "Created $ENV_FILE"
+    fi
+}
+
+load_config() {
+    initialize_config
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    export CVAT_VERSION VTW_HOME VTW_INPUT_DIR VTW_PORT VTW_POSTGRES_PASSWORD
+    export VTW_ADMIN_USERNAME VTW_ADMIN_PASSWORD VTW_MIN_FREE_GB
+    export VTW_COLIMA_PROFILE VTW_COLIMA_CPUS VTW_COLIMA_MEMORY_GB VTW_COLIMA_DISK_GB
+}
+
+compose() {
+    if docker compose version >/dev/null 2>&1; then
+        docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" --project-name visiontrack-workbench "$@"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        docker-compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" --project-name visiontrack-workbench "$@"
+    else
+        fail "Docker Compose is not installed"
+    fi
+}
+
+free_disk_gb() {
+    df -Pk "$WORKBENCH_HOME" | awk 'NR == 2 {printf "%d", $4 / 1024 / 1024}'
+}
+
+check_disk() {
+    local free_gb
+    free_gb=$(free_disk_gb)
+    if (( free_gb < VTW_MIN_FREE_GB )); then
+        if [[ ${VTW_ALLOW_LOW_DISK:-0} == 1 ]]; then
+            log "WARNING: only ${free_gb} GB free; recommended minimum is ${VTW_MIN_FREE_GB} GB"
+        else
+            fail "Only ${free_gb} GB free. Free at least ${VTW_MIN_FREE_GB} GB or explicitly set VTW_ALLOW_LOW_DISK=1."
+        fi
+    fi
+}
+
+install_dependencies() {
+    [[ $(uname -s) == Darwin ]] || fail "This installer currently supports macOS"
+    command -v brew >/dev/null 2>&1 || fail "Homebrew is required: https://brew.sh"
+    local packages=()
+    command -v colima >/dev/null 2>&1 || packages+=(colima)
+    command -v docker >/dev/null 2>&1 || packages+=(docker)
+    command -v docker-compose >/dev/null 2>&1 || packages+=(docker-compose)
+    command -v ffprobe >/dev/null 2>&1 || packages+=(ffmpeg)
+    if ((${#packages[@]})); then
+        log "Installing: ${packages[*]}"
+        brew install "${packages[@]}"
+    else
+        log "macOS dependencies are already installed"
+    fi
+}
+
+ensure_runtime() {
+    command -v colima >/dev/null 2>&1 || fail "Colima is not installed; run '$0 install-deps'"
+    command -v docker >/dev/null 2>&1 || fail "Docker CLI is not installed; run '$0 install-deps'"
+    local docker_socket="$HOME/.colima/$VTW_COLIMA_PROFILE/docker.sock"
+    if colima status "$VTW_COLIMA_PROFILE" >/dev/null 2>&1; then
+        export DOCKER_HOST="unix://$docker_socket"
+        docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable at $docker_socket"
+        return
+    fi
+
+    local profile_exists=0
+    if colima list --json 2>/dev/null | python3 -c \
+        'import json, sys; target=sys.argv[1]; raise SystemExit(0 if any(json.loads(line).get("name") == target for line in sys.stdin if line.strip()) else 1)' \
+        "$VTW_COLIMA_PROFILE"; then
+        profile_exists=1
+    fi
+
+    if (( profile_exists )); then
+        log "Starting existing Colima profile $VTW_COLIMA_PROFILE"
+        colima start "$VTW_COLIMA_PROFILE"
+    else
+        local args=(
+            start "$VTW_COLIMA_PROFILE"
+            --runtime docker
+            --cpus "$VTW_COLIMA_CPUS"
+            --memory "$VTW_COLIMA_MEMORY_GB"
+            --disk "$VTW_COLIMA_DISK_GB"
+            --mount-type virtiofs
+        )
+        if [[ $(uname -m) == arm64 ]]; then
+            args+=(--arch aarch64 --vm-type vz --vz-rosetta)
+            log "Starting dedicated arm64 Colima runtime with Rosetta"
+        else
+            args+=(--arch x86_64)
+            log "Starting dedicated x86_64 Colima runtime"
+        fi
+        colima "${args[@]}"
+    fi
+    export DOCKER_HOST="unix://$docker_socket"
+    docker info >/dev/null 2>&1 || fail "Docker daemon is unavailable after starting Colima"
+}
+
+trim_runtime_disk() {
+    # Container image extraction can temporarily expand Colima's sparse disk.
+    # Discarding free blocks returns that space to macOS without touching data.
+    colima -p "$VTW_COLIMA_PROFILE" ssh -- sudo fstrim -av >/dev/null 2>&1 || true
+}
+
+wait_for_api() {
+    local url="http://localhost:${VTW_PORT}/api/server/health/"
+    local attempts=120
+    log "Waiting for API health at $url"
+    for ((attempt = 1; attempt <= attempts; attempt++)); do
+        if curl --silent --fail --max-time 3 "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    compose ps || true
+    compose logs --tail=100 cvat_server || true
+    fail "CVAT API did not become healthy"
+}
+
+ensure_admin() {
+    log "Provisioning local operator account"
+    compose exec -T \
+        -e VTW_ADMIN_USERNAME="$VTW_ADMIN_USERNAME" \
+        -e VTW_ADMIN_PASSWORD="$VTW_ADMIN_PASSWORD" \
+        cvat_server \
+        python manage.py shell -c \
+        'import os; from django.contrib.auth import get_user_model; U=get_user_model(); u,_=U.objects.get_or_create(username=os.environ["VTW_ADMIN_USERNAME"], defaults={"email":"operator@localhost.invalid", "is_staff":True, "is_superuser":True}); u.is_staff=True; u.is_superuser=True; u.set_password(os.environ["VTW_ADMIN_PASSWORD"]); u.save()' \
+        >/dev/null
+}
+
+ensure_python_environment() {
+    if [[ ! -x "$PYTHON_ENV/bin/python" ]]; then
+        log "Creating local utility environment"
+        python3 -m venv --system-site-packages "$PYTHON_ENV"
+    fi
+    if ! "$PYTHON_ENV/bin/python" -c 'import requests' >/dev/null 2>&1; then
+        if [[ -d "$OPERATOR_DIR/wheelhouse" ]]; then
+            "$PYTHON_ENV/bin/python" -m pip install --no-index \
+                --find-links "$OPERATOR_DIR/wheelhouse" -r "$OPERATOR_DIR/requirements.txt"
+        else
+            "$PYTHON_ENV/bin/python" -m pip install -r "$OPERATOR_DIR/requirements.txt"
+        fi
+    fi
+}
+
+open_app() {
+    local url="http://localhost:${VTW_PORT}"
+    local browsers=(
+        "Google Chrome"
+        "Microsoft Edge"
+        "Brave Browser"
+        "Chromium"
+    )
+    for browser in "${browsers[@]}"; do
+        if [[ -d "/Applications/${browser}.app" ]]; then
+            open -na "$browser" --args --app="$url"
+            return
+        fi
+    done
+    open "$url"
+}
+
+start_workbench() {
+    load_config
+    check_disk
+    ensure_runtime
+    log "Starting Local Operator services"
+    compose up -d
+    trim_runtime_disk
+    wait_for_api
+    ensure_admin
+    log "Workbench is ready at http://localhost:${VTW_PORT}"
+}
+
+import_comparison() {
+    load_config
+    ensure_python_environment
+    "$PYTHON_ENV/bin/python" "$SCRIPT_DIR/bootstrap_tasks.py" \
+        --base-url "http://localhost:${VTW_PORT}" \
+        --username "$VTW_ADMIN_USERNAME" \
+        --password "$VTW_ADMIN_PASSWORD" \
+        --input-root "$VTW_INPUT_DIR" \
+        --manifest "$COMPARISON_MANIFEST" \
+        --labels "$LABELS_FILE" \
+        --report "$VTW_HOME/exports/comparison-import-report.json"
+}
+
+export_ground_truth() {
+    load_config
+    ensure_python_environment
+    "$PYTHON_ENV/bin/python" "$SCRIPT_DIR/export_ground_truth.py" \
+        --base-url "http://localhost:${VTW_PORT}" \
+        --username "$VTW_ADMIN_USERNAME" \
+        --password "$VTW_ADMIN_PASSWORD" \
+        --project-name "VisionTrack Comparison Ground Truth" \
+        --output-dir "$VTW_HOME/exports" \
+        "$@"
+}
+
+backup_database() {
+    load_config
+    local stamp destination
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    destination="$VTW_HOME/backups/cvat-database-${stamp}.sql.gz"
+    compose exec -T cvat_db pg_dump -U cvat cvat | gzip > "$destination"
+    shasum -a 256 "$destination" > "${destination}.sha256"
+    log "Database backup created: $destination"
+}
+
+diagnostics() {
+    load_config
+    local stamp destination
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    destination="$VTW_HOME/logs/diagnostics-${stamp}.txt"
+    {
+        printf 'generated_at=%s\n' "$stamp"
+        printf 'repository=%s\n' "$REPO_ROOT"
+        printf 'free_disk_gb=%s\n' "$(free_disk_gb)"
+        colima status "$VTW_COLIMA_PROFILE" || true
+        docker version || true
+        compose ps || true
+        compose logs --tail=200 || true
+    } > "$destination" 2>&1
+    log "Diagnostics written to $destination"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: workbench <command> [options]
+
+Commands:
+  init [input-dir]       Create the local workspace and secure configuration
+  install-deps          Install missing macOS dependencies with Homebrew
+  pull                  Download pinned application images
+  start                 Start services and provision the local operator account
+  open                  Open Workbench in Chromium application mode
+  import-comparison     Create the five comparison review tasks idempotently
+  export [--include-images]
+                        Export all comparison tasks as verified CVAT packages
+  status                Show service status
+  logs [service]        Follow all logs or one service
+  credentials           Show local URL and operator credentials
+  backup                Create a compressed PostgreSQL backup
+  diagnostics           Capture bounded local diagnostics without source videos
+  trim-disk             Return unused Colima sparse-disk blocks to macOS
+  stop                  Stop application containers but keep the Colima runtime
+  shutdown              Stop containers and the dedicated Colima runtime
+EOF
+}
+
+command=${1:-}
+shift || true
+case "$command" in
+    init)
+        initialize_config "${1:-$DEFAULT_INPUT_DIR}"
+        ;;
+    install-deps)
+        install_dependencies
+        ;;
+    pull)
+        load_config
+        check_disk
+        ensure_runtime
+        compose pull
+        trim_runtime_disk
+        ;;
+    start)
+        start_workbench
+        ;;
+    open)
+        load_config
+        open_app
+        ;;
+    import-comparison)
+        import_comparison
+        ;;
+    export)
+        export_ground_truth "$@"
+        ;;
+    status)
+        load_config
+        ensure_runtime
+        compose ps
+        ;;
+    logs)
+        load_config
+        ensure_runtime
+        if (($#)); then compose logs --follow --tail=200 "$1"; else compose logs --follow --tail=100; fi
+        ;;
+    credentials)
+        load_config
+        printf 'URL: http://localhost:%s\nUsername: %s\nPassword: %s\n' \
+            "$VTW_PORT" "$VTW_ADMIN_USERNAME" "$VTW_ADMIN_PASSWORD"
+        ;;
+    backup)
+        backup_database
+        ;;
+    diagnostics)
+        diagnostics
+        ;;
+    trim-disk)
+        load_config
+        ensure_runtime
+        trim_runtime_disk
+        log "Unused runtime disk blocks returned to macOS"
+        ;;
+    stop)
+        load_config
+        ensure_runtime
+        compose stop
+        ;;
+    shutdown)
+        load_config
+        ensure_runtime
+        compose down
+        colima stop "$VTW_COLIMA_PROFILE"
+        ;;
+    *)
+        usage
+        [[ -z "$command" ]] || exit 2
+        ;;
+esac

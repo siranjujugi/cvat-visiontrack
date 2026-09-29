@@ -49,6 +49,12 @@ assets and dependencies may have separate licenses.
 
 This repository contains the source code and deployment assets for CVAT Community.
 
+## VisionTrack Local Operator Mode
+
+This fork includes a Mac-first, local-only operator workflow for producing VisionTrack vehicle and
+license-plate ground truth. See [operator-mode/README.md](operator-mode/README.md) for installation,
+the comparison-corpus task importer, annotation conventions, lifecycle commands, and exports.
+
 For a fully managed setup, annotation services, or enterprise features, see
 [CVAT Online](https://www.cvat.ai/pricing/cvat-online),
 [CVAT Enterprise](https://www.cvat.ai/enterprise) and

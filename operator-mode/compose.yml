@@ -1,0 +1,262 @@
+# Copyright (C) VisionTrack contributors
+# SPDX-License-Identifier: MIT
+
+name: visiontrack-workbench
+
+x-backend-env: &backend-env
+  CVAT_POSTGRES_HOST: cvat_db
+  CVAT_POSTGRES_PORT: 5432
+  CVAT_POSTGRES_DBNAME: cvat
+  CVAT_POSTGRES_USER: cvat
+  CVAT_POSTGRES_PASSWORD: ${VTW_POSTGRES_PASSWORD:?VTW_POSTGRES_PASSWORD is required}
+  CVAT_REDIS_INMEM_HOST: cvat_redis_inmem
+  CVAT_REDIS_INMEM_PORT: 6379
+  CVAT_REDIS_ONDISK_HOST: cvat_redis_ondisk
+  CVAT_REDIS_ONDISK_PORT: 6666
+  CVAT_LOG_IMPORT_ERRORS: "true"
+  CVAT_ALLOW_STATIC_CACHE: "yes"
+  CVAT_ANALYTICS: "0"
+  CVAT_HOST: localhost
+  CVAT_BASE_URL: http://localhost:${VTW_PORT:-8787}
+  ALLOWED_HOSTS: "*"
+  SMOKESCREEN_OPTS: ""
+  no_proxy: cvat_db,cvat_redis_inmem,cvat_redis_ondisk,cvat_opa,localhost,127.0.0.1
+
+x-backend-deps: &backend-deps
+  cvat_db:
+    condition: service_healthy
+  cvat_redis_inmem:
+    condition: service_healthy
+  cvat_redis_ondisk:
+    condition: service_started
+
+x-backend-volumes: &backend-volumes
+  - type: bind
+    source: ${VTW_HOME:?VTW_HOME is required}/workspace/cvat-data
+    target: /home/django/data
+  - type: bind
+    source: ${VTW_HOME:?VTW_HOME is required}/workspace/keys
+    target: /home/django/keys
+  - type: bind
+    source: ${VTW_HOME:?VTW_HOME is required}/logs/cvat
+    target: /home/django/logs
+  - type: bind
+    source: ${VTW_INPUT_DIR:?VTW_INPUT_DIR is required}
+    target: /home/django/share
+    read_only: true
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: 20m
+    max-file: "5"
+
+services:
+  cvat_db:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cvat
+      POSTGRES_DB: cvat
+      POSTGRES_PASSWORD: ${VTW_POSTGRES_PASSWORD}
+    volumes:
+      - type: bind
+        source: ${VTW_HOME}/workspace/postgres
+        target: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cvat -d cvat"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_redis_inmem:
+    image: redis:7.2.11-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "100", "--appendonly", "yes"]
+    volumes:
+      - type: bind
+        source: ${VTW_HOME}/workspace/redis
+        target: /data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_redis_ondisk:
+    image: apache/kvrocks:2.15.0
+    restart: unless-stopped
+    init: true
+    command: ["--compact-cron", "0 3 * * *"]
+    volumes:
+      - cvat_cache_db:/var/lib/kvrocks
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_opa:
+    image: openpolicyagent/opa:1.12.2
+    restart: unless-stopped
+    command:
+      - run
+      - --server
+      - --addr=:8181
+      - --log-level=error
+      - --set=services.cvat.url=http://cvat-server:8080
+      - --set=bundles.cvat.service=cvat
+      - --set=bundles.cvat.resource=/api/auth/rules
+      - --set=bundles.cvat.polling.min_delay_seconds=5
+      - --set=bundles.cvat.polling.max_delay_seconds=15
+    networks:
+      workbench:
+        aliases: [opa]
+    logging: *bounded-logging
+
+  cvat_server:
+    image: cvat/server:${CVAT_VERSION:-v2.76.0}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      <<: *backend-deps
+      cvat_opa:
+        condition: service_started
+    environment:
+      <<: *backend-env
+      DJANGO_MODWSGI_EXTRA_ARGS: ""
+      NUMPROCS: 2
+      ADAPTIVE_AUTO_ANNOTATION: "false"
+    command: init run server nginx
+    volumes: *backend-volumes
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.vtw-api.loadbalancer.server.port: "8080"
+      traefik.http.routers.vtw-api.rule: >-
+        Host(`localhost`) &&
+        (PathPrefix(`/api/`) || PathPrefix(`/static/`) || PathPrefix(`/admin`)
+        || PathPrefix(`/django-rq`))
+      traefik.http.routers.vtw-api.entrypoints: web
+    networks:
+      workbench:
+        aliases: [cvat-server]
+    logging: *bounded-logging
+
+  cvat_worker_utils:
+    image: cvat/server:${CVAT_VERSION:-v2.76.0}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on: *backend-deps
+    environment:
+      <<: *backend-env
+      CVAT_REDIS_INMEM_PASSWORD: ""
+      NUMPROCS: 1
+    command: run worker notifications cleaning
+    volumes: *backend-volumes
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_worker_import:
+    image: cvat/server:${CVAT_VERSION:-v2.76.0}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on: *backend-deps
+    environment:
+      <<: *backend-env
+      NUMPROCS: 1
+    command: run worker import
+    volumes: *backend-volumes
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_worker_export:
+    image: cvat/server:${CVAT_VERSION:-v2.76.0}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on: *backend-deps
+    environment:
+      <<: *backend-env
+      NUMPROCS: 1
+    command: run worker export
+    volumes: *backend-volumes
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_worker_annotation:
+    image: cvat/server:${CVAT_VERSION:-v2.76.0}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on: *backend-deps
+    environment:
+      <<: *backend-env
+      NUMPROCS: 1
+    command: run worker annotation
+    volumes: *backend-volumes
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_worker_chunks:
+    image: cvat/server:${CVAT_VERSION:-v2.76.0}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on: *backend-deps
+    environment:
+      <<: *backend-env
+      NUMPROCS: 2
+    command: run worker chunks
+    volumes: *backend-volumes
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_worker_quality_reports:
+    image: cvat/server:${CVAT_VERSION:-v2.76.0}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on: *backend-deps
+    environment:
+      <<: *backend-env
+      NUMPROCS: 1
+    command: run worker quality_reports
+    volumes: *backend-volumes
+    networks: [workbench]
+    logging: *bounded-logging
+
+  cvat_ui:
+    image: cvat/ui:${CVAT_VERSION:-v2.76.0}
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on: [cvat_server]
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.vtw-ui.loadbalancer.server.port: "8000"
+      traefik.http.routers.vtw-ui.rule: Host(`localhost`)
+      traefik.http.routers.vtw-ui.entrypoints: web
+    networks: [workbench]
+    logging: *bounded-logging
+
+  router:
+    image: traefik:v3.6
+    restart: unless-stopped
+    ports:
+      - 127.0.0.1:${VTW_PORT:-8787}:8080
+    environment:
+      TRAEFIK_ENTRYPOINTS_web_ADDRESS: :8080
+      TRAEFIK_PROVIDERS_DOCKER_EXPOSEDBYDEFAULT: "false"
+      TRAEFIK_PROVIDERS_DOCKER_NETWORK: visiontrack-workbench_workbench
+      TRAEFIK_ACCESSLOG: "true"
+      TRAEFIK_ACCESSLOG_FORMAT: json
+      TRAEFIK_LOG_FORMAT: json
+      TRAEFIK_LOG_LEVEL: WARN
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [workbench]
+    logging: *bounded-logging
+
+networks:
+  workbench:
+    name: visiontrack-workbench_workbench
+
+volumes:
+  cvat_cache_db:
+    name: visiontrack-workbench-cvat-cache

@@ -1,0 +1,139 @@
+[
+  {
+    "name": "vehicle",
+    "color": "#2f855a",
+    "type": "any",
+    "attributes": [
+      {
+        "name": "vehicle_class",
+        "mutable": false,
+        "input_type": "select",
+        "default_value": "unknown",
+        "values": [
+          "car",
+          "motorcycle",
+          "scooter",
+          "auto_rickshaw",
+          "bus",
+          "truck",
+          "van",
+          "tractor",
+          "bicycle",
+          "other",
+          "unknown"
+        ]
+      },
+      {
+        "name": "vehicle_color",
+        "mutable": false,
+        "input_type": "select",
+        "default_value": "unknown",
+        "values": [
+          "white",
+          "black",
+          "silver",
+          "grey",
+          "red",
+          "blue",
+          "green",
+          "yellow",
+          "brown",
+          "orange",
+          "other",
+          "unknown"
+        ]
+      },
+      {
+        "name": "direction",
+        "mutable": false,
+        "input_type": "select",
+        "default_value": "unknown",
+        "values": [
+          "entering",
+          "exiting",
+          "left_to_right",
+          "right_to_left",
+          "stationary",
+          "unknown"
+        ]
+      },
+      {
+        "name": "visibility",
+        "mutable": true,
+        "input_type": "select",
+        "default_value": "clear",
+        "values": ["clear", "partial", "occluded", "blurred"]
+      },
+      {
+        "name": "vehicle_instance_id",
+        "mutable": false,
+        "input_type": "text",
+        "default_value": "",
+        "values": []
+      },
+      {
+        "name": "review_status",
+        "mutable": false,
+        "input_type": "select",
+        "default_value": "pending",
+        "values": ["pending", "certified", "rejected"]
+      },
+      {
+        "name": "operator_comment",
+        "mutable": false,
+        "input_type": "text",
+        "default_value": "",
+        "values": []
+      }
+    ]
+  },
+  {
+    "name": "license_plate",
+    "color": "#d69e2e",
+    "type": "any",
+    "attributes": [
+      {
+        "name": "plate_readability",
+        "mutable": true,
+        "input_type": "select",
+        "default_value": "unreadable",
+        "values": ["exact", "partial", "unreadable", "no_plate", "not_applicable"]
+      },
+      {
+        "name": "plate_text",
+        "mutable": false,
+        "input_type": "text",
+        "default_value": "",
+        "values": []
+      },
+      {
+        "name": "associated_vehicle_id",
+        "mutable": false,
+        "input_type": "text",
+        "default_value": "",
+        "values": []
+      },
+      {
+        "name": "plate_visibility",
+        "mutable": true,
+        "input_type": "select",
+        "default_value": "clear",
+        "values": ["clear", "partial", "occluded", "blurred", "glare", "too_small"]
+      },
+      {
+        "name": "review_status",
+        "mutable": false,
+        "input_type": "select",
+        "default_value": "pending",
+        "values": ["pending", "certified", "rejected"]
+      },
+      {
+        "name": "operator_comment",
+        "mutable": false,
+        "input_type": "text",
+        "default_value": "",
+        "values": []
+      }
+    ]
+  }
+]
